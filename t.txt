@@ -1,0 +1,6 @@
+Mode: PARALLEL
+
+--- Statistics ---
+Total time:   0.2035 s
+Avg per file: 0.0963 s
+Files:        8

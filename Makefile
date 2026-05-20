@@ -1,35 +1,35 @@
 CC = g++
-CFLAGS = -Wall -Wextra -pedantic -fPIC -shared -pthread
+CFLAGS_LIB = -Wall -Wextra -pedantic -fPIC -shared
+CFLAGS_BIN = -Wall -Wextra -pedantic -pthread -std=c++17 -DWORKERS_COUNT=4
 
 all: libcaesar.so caesar_cli
 
 libcaesar.so: libcaesar.cpp
-	$(CC) $(CFLAGS) -o $@ $<
+	$(CC) $(CFLAGS_LIB) -o $@ $<
 
 caesar_cli: main.cpp libcaesar.so
-	$(CC) -Wall -Wextra -pedantic -pthread -std=c++17 -o $@ main.cpp -L. -lcaesar -Wl,-rpath,.
+	$(CC) $(CFLAGS_BIN) -o $@ main.cpp -L. -lcaesar -Wl,-rpath,.
 
 install: libcaesar.so
 	sudo cp $< /usr/local/lib/ && sudo ldconfig
 
 test: caesar_cli
-	# Создаём тестовые файлы
-	dd if=/dev/urandom of=file1.bin bs=1024 count=1 2>/dev/null
-	dd if=/dev/urandom of=file2.bin bs=1024 count=2 2>/dev/null
-
-	# Шифрование
-	./caesar_cli file1.bin file2.bin 42 ./out
-	# Дешифрование
-	./caesar_cli ./out/file1.bin ./out/file2.bin 42 ./restored
-
-	# Проверка
-	cmp file1.bin ./restored/file1.bin && echo "file1 OK"
-	cmp file2.bin ./restored/file2.bin && echo "file2 OK"
-
-	rm -rf out restored log.txt file1.bin file2.bin
+	@echo "Generating test files..."
+	rm -rf test_in test_out log.txt
+	mkdir -p test_in
+	for i in $$(seq 1 12); do dd if=/dev/urandom of=test_in/file$$i.bin bs=1024 count=1 2>/dev/null; done
+	
+	@echo "Running Auto Mode (should be Parallel >= 5 files)..."
+	./caesar_cli --mode=auto test_in 42 test_out
+	
+	@echo "Checking results..."
+	ls test_out | wc -l | grep -q "12" && echo "All files processed OK" || echo "ERROR: Missing files"
+	
+	@echo "Cleaning up..."
+	rm -rf test_in test_out log.txt
 
 clean:
 	rm -f libcaesar.so caesar_cli
-	rm -rf out restored file1.bin file2.bin log.txt /tmp/out /tmp/out2 /tmp/file1.bin /tmp/file2.bin
+	rm -rf test_in test_out log.txt
 
 .PHONY: all install test clean

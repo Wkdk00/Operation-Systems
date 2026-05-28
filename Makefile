@@ -1,35 +1,28 @@
 CC = g++
 CFLAGS_LIB = -Wall -Wextra -pedantic -fPIC -shared
-CFLAGS_BIN = -Wall -Wextra -pedantic -pthread -std=c++17 -DWORKERS_COUNT=4
+CFLAGS_BIN = -Wall -Wextra -pedantic -pthread -std=c++17 -DWORKERS_COUNT=5
 
-all: libcaesar.so caesar_cli
+all: librc4.so secure_copy
 
-libcaesar.so: libcaesar.cpp
+librc4.so: librc4.cpp
 	$(CC) $(CFLAGS_LIB) -o $@ $<
 
-caesar_cli: main.cpp libcaesar.so
-	$(CC) $(CFLAGS_BIN) -o $@ main.cpp -L. -lcaesar -Wl,-rpath,.
+secure_copy: main.cpp librc4.so
+	$(CC) $(CFLAGS_BIN) -o $@ main.cpp -L. -lrc4 -Wl,-rpath,.
 
-install: libcaesar.so
+install: librc4.so
 	sudo cp $< /usr/local/lib/ && sudo ldconfig
 
-test: caesar_cli
-	@echo "Generating test files..."
-	rm -rf test_in test_out log.txt
-	mkdir -p test_in
-	for i in $$(seq 1 12); do dd if=/dev/urandom of=test_in/file$$i.bin bs=1024 count=1 2>/dev/null; done
-	
-	@echo "Running Auto Mode (should be Parallel >= 5 files)..."
-	./caesar_cli --mode=auto test_in 42 test_out
-	
-	@echo "Checking results..."
-	ls test_out | wc -l | grep -q "12" && echo "All files processed OK" || echo "ERROR: Missing files"
-	
-	@echo "Cleaning up..."
-	rm -rf test_in test_out log.txt
+test: secure_copy
+	@rm -rf t_in t_out t.img; mkdir -p t_in t_out
+	@for i in 1 2 3; do echo "test$$i" > t_in/f$$i.txt; done
+	@./secure_copy -add -key "k" -image t.img t_in/
+	@for i in 1 2 3; do ./secure_copy -get -image t.img -key "k" -out t_out/f$$i.txt t_in/f$$i.txt 2>/dev/null; done
+	@cmp -s t_in/f1.txt t_out/f1.txt && cmp -s t_in/f2.txt t_out/f2.txt && cmp -s t_in/f3.txt t_out/f3.txt && echo "✓ Tests passed" || echo "✗ Tests failed"
+	@rm -rf t_in t_out t.img
 
 clean:
-	rm -f libcaesar.so caesar_cli
-	rm -rf test_in test_out log.txt
+	rm -f librc4.so secure_copy
+	rm -rf disk.img out result_file test_in test_out test_image.img
 
 .PHONY: all install test clean

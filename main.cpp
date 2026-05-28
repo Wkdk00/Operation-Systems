@@ -3,28 +3,25 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <chrono>
-#include <iomanip>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <iostream>
 #include <cstdlib>
 #include <string>
 #include <ctime>
+#include <algorithm>
 
 extern "C" {
-    void set_key(char key);
-    void caesar(void* src, void* dst, int len);
+    void rc4_crypt(const uint8_t* key, int key_len, const uint8_t* in, uint8_t* out, int data_len);
 }
 
 #ifndef WORKERS_COUNT
-#define WORKERS_COUNT 4
+#define WORKERS_COUNT 5
 #endif
 
-// Глобальные структуры для очереди задач
 struct FileTask {
-    std::string in_path;
-    std::string out_dir;
+    std::string disk_path;
+    std::string arch_name;
 };
 
 std::vector<FileTask> task_queue;
@@ -33,9 +30,12 @@ bool finished_adding = false;
 
 std::mutex queue_mutex;
 std::condition_variable cv;
-std::mutex log_mutex;
+std::mutex image_mutex;
 
-// 1. Сбор файлов
+std::string global_image_path;
+std::string global_key;
+
+// 1. Сбор файлов (с учетом вложенности директорий)
 void collect_files(const std::string& path, std::vector<std::string>& files) {
     struct stat st;
     if (stat(path.c_str(), &st) != 0) return;
@@ -49,201 +49,198 @@ void collect_files(const std::string& path, std::vector<std::string>& files) {
         while ((entry = readdir(dir)) != nullptr) {
             std::string name = entry->d_name;
             if (name == "." || name == "..") continue;
-            collect_files(path + "/" + name, files);
+            collect_files(path + (path.back() == '/' ? "" : "/") + name, files);
         }
         closedir(dir);
     }
 }
 
-// 2. Создание папок
-void mkdirs(const std::string& path) {
-    size_t pos = 0;
-    if (path[0] == '/') pos = 1;
-    else if (path.substr(0, 2) == "./") pos = 1;
-    
-    while ((pos = path.find('/', pos + 1)) != std::string::npos) {
-        mkdir(path.substr(0, pos).c_str(), 0755);
-        pos++; 
+// 2. Обработка файла (Шифрование RC4 и добавление в образ)
+void process_add_task(const FileTask& task) {
+    std::ifstream in(task.disk_path, std::ios::binary | std::ios::ate);
+    if (!in) {
+        std::cerr << "Error reading: " << task.disk_path << "\n";
+        return;
     }
-}
-
-// 3. Обработка файла (возвращает время выполнения)
-double process_file_task(const std::string& in_path, const std::string& out_dir) {
-    struct timespec start, end;
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    std::ifstream in(in_path, std::ios::binary | std::ios::ate);
-    if (!in) return 0.0;
     
     std::streamsize size = in.tellg();
     in.seekg(0, std::ios::beg);
-    std::vector<char> buffer(size);
-    if (!in.read(buffer.data(), size)) return 0.0;
+    std::vector<uint8_t> buffer(size);
+    if (size > 0 && !in.read(reinterpret_cast<char*>(buffer.data()), size)) return;
 
-    // XOR шифрование
-    caesar(buffer.data(), buffer.data(), static_cast<int>(size));
+    // Генерация 16-байтовой соли
+    uint8_t salt[16];
+    for (int i = 0; i < 16; ++i) salt[i] = rand() % 256;
 
-    std::string filename = in_path.substr(in_path.find_last_of("/\\") + 1);
-    std::string out_path = out_dir + (out_dir.back() == '/' ? "" : "/") + filename;
-    
-    mkdirs(out_path);
+    // Инициализационная последовательность (Ключ + Соль)
+    std::vector<uint8_t> rc4_key(global_key.begin(), global_key.end());
+    rc4_key.insert(rc4_key.end(), salt, salt + 16);
 
-    std::ofstream out(out_path, std::ios::binary);
-    if (out) out.write(buffer.data(), size);
+    // Шифрование
+    rc4_crypt(rc4_key.data(), rc4_key.size(), buffer.data(), buffer.data(), size);
 
-    // Лог
-    {
-        std::lock_guard<std::mutex> lock(log_mutex);
-        std::ofstream log("log.txt", std::ios::app);
-        if (log) {
-            auto now = std::chrono::system_clock::now();
-            auto time = std::chrono::system_clock::to_time_t(now);
-            log << std::put_time(std::localtime(&time), "%Y-%m-%d %H:%M:%S") 
-                << " " << in_path << "\n";
-        }
+    // Потокобезопасная запись в образ
+    std::lock_guard<std::mutex> lock(image_mutex);
+    std::ofstream out(global_image_path, std::ios::binary | std::ios::app);
+    if (!out) {
+        std::cerr << "Error writing to image\n";
+        return;
     }
 
-    clock_gettime(CLOCK_MONOTONIC, &end);
-    return (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+    uint32_t file_len = size;
+    uint32_t name_len = task.arch_name.length();
+
+    out.write(reinterpret_cast<char*>(&file_len), 4);
+    out.write(reinterpret_cast<char*>(&name_len), 4);
+    out.write(reinterpret_cast<char*>(salt), 16);
+    out.write(task.arch_name.data(), name_len);
+    if (size > 0) out.write(reinterpret_cast<char*>(buffer.data()), file_len);
 }
 
-// Функция потока из пула
-void worker_func(std::vector<double>& times, std::mutex& times_mutex) {
+// 3. Функция потока из пула
+void worker_func() {
     while (true) {
         std::unique_lock<std::mutex> lock(queue_mutex);
-        // Ждем, пока есть задачи или работа завершена
         cv.wait(lock, [] { return queue_head < task_queue.size() || finished_adding; });
 
         if (queue_head >= task_queue.size()) break;
-
-        // Забираем задачу
         FileTask task = task_queue[queue_head++];
         lock.unlock();
 
-        double t = process_file_task(task.in_path, task.out_dir);
-        
-        {
-            std::lock_guard<std::mutex> t_lock(times_mutex);
-            times.push_back(t);
-        }
+        process_add_task(task);
     }
 }
 
-enum Mode { SEQUENTIAL, PARALLEL, AUTO };
+// 4. Просмотр перечня файлов
+void list_files() {
+    std::ifstream in(global_image_path, std::ios::binary);
+    if (!in) {
+        std::cerr << "Image not found or error opening.\n";
+        return;
+    }
+    std::vector<std::pair<std::string, uint32_t>> files;
+
+    while (in.peek() != EOF) {
+        uint32_t file_len, name_len;
+        uint8_t salt[16];
+        if (!in.read(reinterpret_cast<char*>(&file_len), 4)) break;
+        if (!in.read(reinterpret_cast<char*>(&name_len), 4)) break;
+        if (!in.read(reinterpret_cast<char*>(salt), 16)) break;
+
+        std::string name(name_len, '\0');
+        if (!in.read(&name[0], name_len)) break;
+
+        files.push_back({name, file_len});
+        in.seekg(file_len, std::ios::cur);
+    }
+
+    std::sort(files.begin(), files.end());
+    for (const auto& f : files) {
+        std::cout << f.first << " - " << f.second << " bytes\n";
+    }
+}
+
+// 5. Просмотр (извлечение) содержимого файла
+void get_file(const std::string& target, const std::string& out_path) {
+    std::ifstream in(global_image_path, std::ios::binary);
+    if (!in) {
+        std::cerr << "Image not found.\n";
+        return;
+    }
+
+    while (in.peek() != EOF) {
+        uint32_t file_len, name_len;
+        uint8_t salt[16];
+        if (!in.read(reinterpret_cast<char*>(&file_len), 4)) break;
+        if (!in.read(reinterpret_cast<char*>(&name_len), 4)) break;
+        if (!in.read(reinterpret_cast<char*>(salt), 16)) break;
+
+        std::string name(name_len, '\0');
+        if (!in.read(&name[0], name_len)) break;
+
+        if (name == target) {
+            std::vector<uint8_t> buffer(file_len);
+            if (file_len > 0 && !in.read(reinterpret_cast<char*>(buffer.data()), file_len)) return;
+
+            std::vector<uint8_t> rc4_key(global_key.begin(), global_key.end());
+            rc4_key.insert(rc4_key.end(), salt, salt + 16);
+
+            rc4_crypt(rc4_key.data(), rc4_key.size(), buffer.data(), buffer.data(), file_len);
+
+            std::ofstream out(out_path, std::ios::binary);
+            if (file_len > 0) out.write(reinterpret_cast<char*>(buffer.data()), file_len);
+            std::cout << "Extracted " << target << " to " << out_path << "\n";
+            return;
+        } else {
+            in.seekg(file_len, std::ios::cur); // Пропуск содержимого других файлов
+        }
+    }
+    std::cerr << "File not found in image.\n";
+}
+
+enum Action { ADD, LIST, GET, NONE };
 
 int main(int argc, char* argv[]) {
-    if (argc < 4) {
-        std::cerr << "Usage: " << argv[0] << " [--mode=seq|par|auto] <files...> <key> <out_dir>\n";
-        return 1;
-    }
+    Action action = NONE;
+    std::string out_file, target_file;
+    std::vector<std::string> inputs;
 
-    Mode mode = AUTO;
-    int start_idx = 1;
-
-    // Парсинг режима
-    if (std::string(argv[1]).find("--mode=") == 0) {
-        std::string m = argv[1];
-        if (m == "--mode=seq") mode = SEQUENTIAL;
-        else if (m == "--mode=par") mode = PARALLEL;
-        else mode = AUTO;
-        start_idx = 2;
-    }
-
-    const char* out_dir = argv[argc - 1];
-    int key = std::atoi(argv[argc - 2]) & 0xFF;
-    
-    // Сбор файлов
-    std::vector<std::string> files;
-    for (int i = start_idx; i < argc - 2; ++i) {
-        collect_files(argv[i], files);
-    }
-
-    if (files.empty()) {
-        std::cerr << "No files found.\n";
-        return 1;
-    }
-
-    set_key(static_cast<char>(key));
-    std::ofstream("log.txt", std::ios::trunc); // Очистка лога
-
-    // Авто-выбор режима
-    if (mode == AUTO) {
-        mode = (files.size() < 5) ? SEQUENTIAL : PARALLEL;
-    }
-
-    std::cout << "Mode: " << (mode == SEQUENTIAL ? "SEQUENTIAL" : "PARALLEL") << "\n";
-
-    struct timespec global_start, global_end;
-    clock_gettime(CLOCK_MONOTONIC, &global_start);
-
-    std::vector<double> file_times;
-    file_times.reserve(files.size());
-
-    if (mode == SEQUENTIAL) {
-        // Последовательная обработка
-        for (const auto& f : files) {
-            double t = process_file_task(f, out_dir);
-            file_times.push_back(t);
+    // Парсинг аргументов
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-add") action = ADD;
+        else if (arg == "-list") action = LIST;
+        else if (arg == "-get") action = GET;
+        else if (arg == "-key" && i + 1 < argc) global_key = argv[++i];
+        else if (arg == "-image" && i + 1 < argc) global_image_path = argv[++i];
+        else if (arg == "-out" && i + 1 < argc) out_file = argv[++i];
+        else {
+            if (action == ADD) inputs.push_back(arg);
+            else if (action == GET && target_file.empty()) target_file = arg;
         }
-    } else {
-        // Параллельная обработка (Пул потоков)
-        std::mutex times_mutex;
-        
-        // Заполняем очередь
+    }
+
+    if (global_image_path.empty() || action == NONE) {
+        std::cerr << "Invalid arguments. Usage:\n"
+                  << "  ./secure_copy -add -key <key> -image <image> <files/dirs...>\n"
+                  << "  ./secure_copy -list -image <image>\n"
+                  << "  ./secure_copy -get -image <image> -key <key> -out <result> <file_name>\n";
+        return 1;
+    }
+
+    srand(time(nullptr));
+
+    if (action == ADD) {
+        if (global_key.empty() || inputs.empty()) {
+            std::cerr << "Key or input files missing for add operation.\n";
+            return 1;
+        }
+        std::vector<std::string> all_files;
+        for (const auto& in_p : inputs) collect_files(in_p, all_files);
+
         {
             std::lock_guard<std::mutex> lock(queue_mutex);
-            for (const auto& f : files) {
-                task_queue.push_back({f, out_dir});
+            for (const auto& f : all_files) {
+                task_queue.push_back({f, f}); // Имя файла сохраняется как путь
             }
-            finished_adding = false;
-        }
-
-        std::vector<std::thread> workers;
-        for (int i = 0; i < WORKERS_COUNT; ++i) {
-            workers.emplace_back(worker_func, std::ref(file_times), std::ref(times_mutex));
-        }
-
-        // Сигнал старта
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex);
             finished_adding = true;
         }
-        cv.notify_all();
-
-        for (auto& w : workers) w.join();
-    }
-
-    clock_gettime(CLOCK_MONOTONIC, &global_end);
-    double total_time = (global_end.tv_sec - global_start.tv_sec) + 
-                        (global_end.tv_nsec - global_start.tv_nsec) / 1e9;
-    
-    double avg_time = 0;
-    if (!file_times.empty()) {
-        double sum = 0;
-        for (double t : file_times) sum += t;
-        avg_time = sum / file_times.size();
-    }
-
-    // Вывод статистики
-    std::cout << "\n--- Statistics ---\n";
-    std::cout << "Total time:   " << std::fixed << std::setprecision(4) << total_time << " s\n";
-    std::cout << "Avg per file: " << std::fixed << std::setprecision(4) << avg_time << " s\n";
-    std::cout << "Files:        " << file_times.size() << "\n";
-
-    // Сравнение для авто-режима
-    if (mode == AUTO) {
-        std::cout << "\n--- Comparison ---\n";
-        if (files.size() >= 5) {
-            // Parallel. Seq = сумма всех времен.
-            double seq_est = 0;
-            for(double t : file_times) seq_est += t;
-            std::cout << "Used (Parallel):  " << total_time << " s\n";
-            std::cout << "Alt (Sequential): " << seq_est << " s\n";
-        } else {
-            // Sequential. Par = примерно общее / кол-во потоков.
-            std::cout << "Used (Sequential): " << total_time << " s\n";
-            std::cout << "Alt (Parallel):    ~" << total_time / WORKERS_COUNT << " s\n";
+        
+        std::vector<std::thread> workers;
+        for (int i = 0; i < WORKERS_COUNT; ++i) {
+            workers.emplace_back(worker_func);
         }
+        cv.notify_all();
+        for (auto& w : workers) w.join();
+
+    } else if (action == LIST) {
+        list_files();
+    } else if (action == GET) {
+        if (global_key.empty() || out_file.empty() || target_file.empty()) {
+            std::cerr << "Missing arguments for get operation.\n";
+            return 1;
+        }
+        get_file(target_file, out_file);
     }
 
     return 0;

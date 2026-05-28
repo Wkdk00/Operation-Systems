@@ -1,0 +1,1 @@
+docker run -it --rm -v C:/tmp/ostest:/app/img os bash
